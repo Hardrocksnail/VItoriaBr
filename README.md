@@ -309,18 +309,20 @@ Diagnostics build:
 cargo build --profile diag -p victory --features diagnostics
 ```
 
-### 8 GB cards: no black faces, sky instead of garbage rays (branch `nvidia-8gb-textures`)
+### 8 GB cards: no black faces, no rays walking garbage (branch `nvidia-8gb-textures`)
 
-Measured on an RTX 4060 Laptop (8 GB, budget about 7 GB) in the intro: frames rendered in the 150 s after the first world frame, the 8 GB values of the preset above.
+Measured on an RTX 4060 Laptop (8 GB, budget about 7 GB) in the intro: frames rendered in the 150 s after the first world frame, with the 8 GB budget values (`VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_TEXTURE_BUDGET_MB=5120`).
 
 | Settings | fps | Faces |
 |----------|-----|-------|
-| Preset | 2.3 | black while their textures wait for room (15,500 refused) |
-| + `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_TEXTURE_MAX_SIZE=2048` | 3.2 | lit (none refused) |
-| + `VICTORY_BVH_MISS=!a119712dc08b0171,b2efa9e53e9aa087,5f13c9550dc4ab39,f607780aa8e502d0` | 3.5 | lit; sunsets without the sky wedge |
+| v15 preset | 2.3 | black while their textures wait for room (15,500 refused) |
+| v15 + `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_TEXTURE_MAX_SIZE=2048` | 3.2 | lit (none refused) |
+| v15 + those + `VICTORY_BVH_MISS=!a119712dc08b0171,b2efa9e53e9aa087,5f13c9550dc4ab39,f607780aa8e502d0` | 3.5 | lit |
+| v19 preset + the `VICTORY_BVH_MISS` above | 4.1 | black at times; 24.1 GB private memory |
+| v19 preset + all three | 5.2 | lit; 21.1 GB |
 
 - **`VICTORY_TEXTURE_MAX_SIZE=<texels>`** (needs `VICTORY_LEVELS_ON_DEMAND=1`): a texture wider or taller than the cap leaves its largest levels out. They get no memory, are neither detiled nor uploaded, and its views start at the first level that fits. The title's textures want about 14 GB; with the preset's `VICTORY_TEXTURE_BUDGET_MB=5120` the card stood at 9.5 GB of a 6.9 GB budget. With the cap: no texture refused, uploads halved, the title's private memory 20.8 GB at most instead of 23.6. Close-ups at 1920x1080 look as sharp.
-- **`VICTORY_BVH_MISS`**: the ray-tracing structures are never built on a 32-lane host (the builder runs all or none), so the title's ray-tracing programs walk whatever bytes lie there (black sea, a hard wedge in sunset skies, wasted card time). With the switch the node test reports a miss without reading memory and the title shades its sky probe. `1`: in every program; `<hash>,...`: in those alone; `!<hash>,...`: in all but those. Misses in the irradiance cache's four programs (hashes above, game 1.0.2.1) turn faces black for a while, so leave those out.
+- **`VICTORY_BVH_MISS`**: the ray-tracing structures are never built on a 32-lane host (the builder runs all or none), so the title's ray-tracing programs walk whatever bytes lie there: what they return is no picture of the scene, and the walks cost card time. With the switch the node test reports a miss without reading memory and the title shades its sky probe. (The dark sea and the hard wedge in the sky of the intro's ocean shot stay with it: they have another cause.) `1`: in every program; `<hash>,...`: in those alone; `!<hash>,...`: in all but those. Misses in the irradiance cache's four programs (hashes above, game 1.0.2.1) turn faces black for a while, so leave those out.
 - **`VICTORY_AMBIENT=0.35`** instead of 0.6: the constant fill light washes faces out at night.
 
 ## License
