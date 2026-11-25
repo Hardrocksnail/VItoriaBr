@@ -120,6 +120,53 @@ pub(crate) fn floor() -> u64 {
     *BYTES.get_or_init(|| parse_floor(std::env::var("VICTORY_LEVELS_MIN_KB").ok().as_deref()))
 }
 
+/// The largest levels left out of a texture made level by level: those
+/// wider or taller than `VICTORY_TEXTURE_MAX_SIZE` texels (256 or more;
+/// unset: none). They get no memory and the texture's views start at the
+/// first level that fits (`Staging::judgement` counts them as not the
+/// title's, [`show_from`] starts the views below them). Each level left out
+/// is three quarters of the texture's memory. For a card too small for the
+/// title's textures: on an 8 GB RTX 4060 Laptop the textures the title
+/// fills wanted 14 GB against a budget of 6.9 GB that 2.7 GB of render
+/// targets shared, and the textures that waited for room (faces among
+/// them) were black until some were let go. A texture larger than the cap
+/// is made this way although it holds all its levels (`resource.rs`
+/// `hosted`). At least the last level is kept.
+pub(crate) fn levels_over_cap(width: u64, height: u64, levels: u32) -> u32 {
+    over_cap(cap(), width, height, levels)
+}
+
+/// `VICTORY_TEXTURE_MAX_SIZE`, read once: the largest side a texture's
+/// first shown level may have.
+fn cap() -> Option<u64> {
+    static CAP: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        let cap = std::env::var("VICTORY_TEXTURE_MAX_SIZE")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(|texels| texels.max(256));
+        if let Some(cap) = cap {
+            tracing::info!(
+                cap,
+                levels_on_demand = std::env::var_os("VICTORY_LEVELS_ON_DEMAND").is_some_and(|v| v == "1"),
+                "textures larger than the cap leave their largest levels out (VICTORY_TEXTURE_MAX_SIZE; it needs VICTORY_LEVELS_ON_DEMAND=1)"
+            );
+        }
+        cap
+    })
+}
+
+fn over_cap(cap: Option<u64>, width: u64, height: u64, levels: u32) -> u32 {
+    let Some(cap) = cap else {
+        return 0;
+    };
+    let mut skip = 0;
+    while skip + 1 < levels && skip < 63 && (width >> skip).max(height >> skip) > cap {
+        skip += 1;
+    }
+    skip
+}
+
 /// The bytes of the tiles given to textures now: the card's memory they
 /// hold (`resource.rs` `room` counts it with the other host copies).
 pub(crate) fn given_total() -> u64 {
@@ -1478,6 +1525,24 @@ void look() {
         assert_eq!(parse_floor(Some("2048")), 2048 << 10);
         assert_eq!(parse_floor(Some(&(1u64 << 54).to_string())), u64::MAX);
         assert_eq!(parse_floor(Some(&u64::MAX.to_string())), u64::MAX);
+    }
+
+    #[test]
+    fn the_cap_leaves_out_only_levels_larger_than_it() {
+        // No cap: nothing left out.
+        assert_eq!(over_cap(None, 4096, 4096, 13), 0);
+        // 4096 under a cap of 2048: one level; of 1024: two.
+        assert_eq!(over_cap(Some(2048), 4096, 4096, 13), 1);
+        assert_eq!(over_cap(Some(1024), 4096, 4096, 13), 2);
+        // At the cap, or under it: kept whole.
+        assert_eq!(over_cap(Some(2048), 2048, 2048, 12), 0);
+        assert_eq!(over_cap(Some(2048), 1024, 512, 11), 0);
+        // The larger side decides.
+        assert_eq!(over_cap(Some(1024), 4096, 256, 13), 2);
+        assert_eq!(over_cap(Some(1024), 256, 2048, 12), 1);
+        // The last level stays, however large.
+        assert_eq!(over_cap(Some(256), 4096, 4096, 2), 1);
+        assert_eq!(over_cap(Some(256), 4096, 4096, 1), 0);
     }
 
     #[test]

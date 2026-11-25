@@ -701,8 +701,13 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
     const COPY_DEST: u32 = 0x400;
     crate::list::ensure_state(list, resource, COPY_DEST);
     // The staging buffer lives as long as `staging`, which the deferred
-    // refresh below holds until the list is reset.
+    // refresh below holds until the list is reset. (Levels over the cap,
+    // which never get memory, are not copied: `Staging::over_cap`.)
+    let over_cap = staging.over_cap();
     for (i, footprint) in staging.footprints.iter().enumerate() {
+        if (i as u32 % staging.mips) < over_cap {
+            continue;
+        }
         #[cfg(feature = "diagnostics")]
         {
             let f = footprint.Footprint;
@@ -908,10 +913,28 @@ impl Staging {
     /// levels would be.
     fn judgement(&self) -> [u64; 2] {
         let start = self.memory as u64;
-        let first = crate::descriptor::host::first_viewed(start).map_or(0, u64::from);
+        // (Levels larger than `VICTORY_TEXTURE_MAX_SIZE` are not held
+        // either: `crate::tiles::levels_over_cap`.)
+        let first = crate::descriptor::host::first_viewed(start)
+            .map_or(0, u64::from)
+            .max(u64::from(self.over_cap()));
         let limit = crate::descriptor::host::next_start(start, start.saturating_add(self.layout.size))
             .map_or(u64::MAX, |at| at - start);
         [first, limit]
+    }
+
+    /// Levels on demand: the largest levels this texture leaves out for
+    /// being larger than `VICTORY_TEXTURE_MAX_SIZE`
+    /// (`crate::tiles::levels_over_cap`); 0 for a texture of several layers
+    /// (whose levels are all held). They never get memory, so they are
+    /// neither detiled ([`Staging::detile`]) nor uploaded ([`upload`]).
+    fn over_cap(&self) -> u32 {
+        if !self.on_demand || self.layout.slices != 1 {
+            return 0;
+        }
+        self.footprints.first().map_or(0, |f| {
+            crate::tiles::levels_over_cap(u64::from(f.Footprint.Width), u64::from(f.Footprint.Height), self.mips)
+        })
     }
 
     /// What [`Staging::judgement`] said at the last detiling.
@@ -1157,6 +1180,8 @@ impl Staging {
         } else {
             u32::MAX
         };
+        // Levels over the cap are never uploaded: not even zeros.
+        let over_cap = self.over_cap();
         #[cfg(feature = "diagnostics")]
         if tiled.iter().all(|&b| b == 0) {
             tracing::debug!(
@@ -1167,6 +1192,9 @@ impl Staging {
         }
         for (i, (footprint, &rows)) in self.footprints.iter().zip(&self.rows).enumerate() {
             let (mip, slice) = (i as u32 % self.mips, i as u32 / self.mips);
+            if mip < over_cap {
+                continue;
+            }
             let f = footprint.Footprint;
             let pitch = f.RowPitch as usize;
             let len = pitch * rows as usize * f.Depth as usize;

@@ -1330,11 +1330,18 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // What the upload can read: a console layout, no XOR mode
             // (`crate::texture` `staging`).
             let readable = texture_layout(&r.desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor());
+            // (A texture larger than `VICTORY_TEXTURE_MAX_SIZE` too: its
+            // largest levels are left out, `crate::tiles::levels_over_cap`.)
             let partly = readable
                 && bytes >= crate::tiles::floor()
                 && (!crate::texture::committed(r.data().cast_const(), bytes as usize)
                     || crate::descriptor::host::next_start(start, start.saturating_add(bytes)).is_some()
-                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0));
+                    || crate::descriptor::host::first_viewed(start).is_some_and(|first| first > 0)
+                    || crate::tiles::levels_over_cap(
+                        r.desc.width,
+                        u64::from(r.desc.height),
+                        u32::from(r.desc.mip_levels),
+                    ) > 0);
             let reserved = if partly { host_texture_as(&r.desc, r.host.state, clear, true) } else { None };
             let cut = reserved
                 .as_ref()
