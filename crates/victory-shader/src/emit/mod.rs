@@ -294,6 +294,31 @@ pub struct UserData {
     pub dword: u32,
 }
 
+thread_local! {
+    /// The 16 hex digits a run's log names the program being translated
+    /// by, when the caller gave them ([`with_program_hash`]).
+    static PROGRAM_HASH: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+/// Runs `f` (a translation) with `hash` as the program's name in the log:
+/// the first 16 hex digits of its container's BLAKE3 hash. Switches that
+/// pick programs by hash read it (`VICTORY_BVH_MISS=<hashes>`).
+pub fn with_program_hash<T>(hash: &str, f: impl FnOnce() -> T) -> T {
+    let before = PROGRAM_HASH.with(|h| std::mem::replace(&mut *h.borrow_mut(), hash.to_owned()));
+    let out = f();
+    PROGRAM_HASH.with(|h| *h.borrow_mut() = before);
+    out
+}
+
+/// Whether the program being translated is named by a hash that starts
+/// with one of `prefixes` (never, without [`with_program_hash`]).
+pub(crate) fn program_hash_starts_with(prefixes: &[String]) -> bool {
+    PROGRAM_HASH.with(|h| {
+        let h = h.borrow();
+        !h.is_empty() && prefixes.iter().any(|p| h.starts_with(p.as_str()))
+    })
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///

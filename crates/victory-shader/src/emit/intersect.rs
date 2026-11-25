@@ -49,9 +49,44 @@ thread_local! {
 /// an RTX 4060 (2026-11-25). With every ray missing each walk ends at its
 /// first node and the title shades the miss: its sky probe. Part of the
 /// translation, so the shader cache keys on it (`translation_fingerprint`).
+///
+/// `VICTORY_BVH_MISS=<hash>,...` does it in those programs alone, and
+/// `VICTORY_BVH_MISS=!<hash>,...` in every program but those (hash
+/// prefixes, as a run's log names programs: `super::with_program_hash`).
 fn bvh_miss() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+    enum Mode {
+        Off,
+        All,
+        Only(Vec<String>),
+        Except(Vec<String>),
+    }
+    static MODE: std::sync::OnceLock<Mode> = std::sync::OnceLock::new();
+    let mode = MODE.get_or_init(|| {
+        let set = std::env::var("VICTORY_BVH_MISS").unwrap_or_default();
+        let set = set.trim();
+        match set {
+            "" | "0" => Mode::Off,
+            "1" => Mode::All,
+            _ => {
+                let (except, list) = match set.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, set),
+                };
+                let hashes = list
+                    .split(',')
+                    .map(|h| h.trim().to_ascii_lowercase())
+                    .filter(|h| !h.is_empty())
+                    .collect();
+                if except { Mode::Except(hashes) } else { Mode::Only(hashes) }
+            }
+        }
+    });
+    match mode {
+        Mode::Off => false,
+        Mode::All => true,
+        Mode::Only(hashes) => crate::emit::program_hash_starts_with(hashes),
+        Mode::Except(hashes) => !crate::emit::program_hash_starts_with(hashes),
+    }
 }
 
 /// Where the instruction's node is.

@@ -87,7 +87,10 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
 }
 
 fn translate(container: &[u8]) -> Result<HostShader, String> {
-    victory_shader::emit::translate(container).map_err(|e| e.to_string())
+    // The program's name in the log, for switches that pick programs by it.
+    let hash = blake3::hash(container).to_hex();
+    victory_shader::emit::with_program_hash(&hash[..16], || victory_shader::emit::translate(container))
+        .map_err(|e| e.to_string())
 }
 
 /// Translates `container` into the cache before a run (`victory warm` /
