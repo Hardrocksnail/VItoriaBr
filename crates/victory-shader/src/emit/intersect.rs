@@ -39,6 +39,21 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// `VICTORY_BVH_MISS=1`: the node test reports a miss for every node,
+/// whatever lies at its address. Without the structure builder
+/// (`VICTORY_BVH_BUILDER`, off by default, and not whole on a host of
+/// 32-lane waves) nothing builds the structures the title's ray-tracing
+/// programs walk (shadows, screen probes, reflections, the irradiance
+/// cache): they walk whatever bytes lie there, in loops of up to 65,535
+/// steps a wave, and shade "hits" on garbage – the sea black at sunset on
+/// an RTX 4060 (2026-11-25). With every ray missing each walk ends at its
+/// first node and the title shades the miss: its sky probe. Part of the
+/// translation, so the shader cache keys on it (`translation_fingerprint`).
+fn bvh_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1"))
+}
+
 /// Where the instruction's node is.
 #[derive(Clone, Copy)]
 enum NodeAt {
@@ -128,6 +143,22 @@ impl<'a> Lower<'a> {
             x.push(self.i32_of(v)?);
         }
         let pointer = x[0];
+        // `VICTORY_BVH_MISS=1`: every ray misses, whatever lies at the
+        // node's address ([`bvh_miss`]): a box node hits none of its
+        // children, a triangle or any other node is missed. No memory read.
+        if bvh_miss() {
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, f) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(f.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            return Ok(());
+        }
         let pointer_high = wide.then(|| x[1]);
         let f: Vec<V> = x[1 + usize::from(wide)..]
             .iter()
