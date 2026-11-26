@@ -754,6 +754,27 @@ fn is_view(start: usize, end: usize) -> bool {
     }
 }
 
+/// `VirtualProtect` calls of the guards and the nanoseconds in them, since
+/// the last [`protect_stats`].
+static PROTECTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The guards' `VirtualProtect` calls and nanoseconds since the last asking.
+pub fn protect_stats() -> (u64, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    (PROTECTS[0].swap(0, Relaxed), PROTECTS[1].swap(0, Relaxed))
+}
+
+/// `VirtualProtect`, counted.
+unsafe fn virtual_protect(at: *const core::ffi::c_void, len: usize, protection: u32, old: &mut u32) -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let started = std::time::Instant::now();
+    // SAFETY: the caller's.
+    let ok = unsafe { windows_sys::Win32::System::Memory::VirtualProtect(at, len, protection, old) };
+    PROTECTS[0].fetch_add(1, Relaxed);
+    PROTECTS[1].fetch_add(started.elapsed().as_nanos() as u64, Relaxed);
+    ok
+}
+
 /// Makes blocks `[from, to)` read-only and notes them guarded and clean;
 /// block by block if they span views, leaving out any that fail, and
 /// noting those not committed (unmapped) absent. The same physical pages
@@ -814,13 +835,13 @@ pub(crate) static ALIASES: [std::sync::atomic::AtomicU64; 3] = [const { std::syn
 /// clean). A block that is clean stays so: had the pages been written since
 /// its copies took them, `open` would have opened it.
 fn protect_alias(g: &mut Guards, block: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     if g.protected.contains(&block) {
         return;
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    if unsafe { virtual_protect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -830,12 +851,12 @@ fn protect_alias(g: &mut Guards, block: usize) {
 
 /// [`protect`] for one range, without the other views of its pages.
 fn protect_here(g: &mut Guards, from: usize, to: usize) {
-    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READONLY;
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
         unsafe {
-            VirtualProtect(
+            virtual_protect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
@@ -920,7 +941,7 @@ fn open(g: &mut Guards, start: usize, end: usize) -> bool {
 
 /// [`open`] for one range, without the other views of its pages.
 fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
-    use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
     let blocks: Vec<usize> = g
         .protected
         .range(start / BLOCK..end.div_ceil(BLOCK))
@@ -931,7 +952,7 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
         g.clean.remove(&block);
         let mut old = 0;
         // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        unsafe { virtual_protect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
     }
     !blocks.is_empty()
 }

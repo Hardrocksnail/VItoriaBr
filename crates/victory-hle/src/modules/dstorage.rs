@@ -592,6 +592,31 @@ impl Lanes {
                 process_cores = format_args!("{process:.2}"),
                 "dstorage: workers' steps (in workers busy with each)"
             );
+            let remaps = |i: usize| super::xmem::REMAPS[i].swap(0, Ordering::Relaxed);
+            let per_s = elapsed.as_secs_f64();
+            let calls = remaps(0);
+            let (views, most_of_one) = super::xmem::view_counts();
+            #[cfg(windows)]
+            let (protects, protect_ns) = victory_gpu::protect_stats();
+            #[cfg(not(windows))]
+            let (protects, protect_ns) = (0u64, 0u64);
+            summary!(
+                protects_per_s = format_args!("{:.0}", protects as f64 / per_s),
+                protect_ms_per_s = format_args!("{:.0}", protect_ns as f64 / 1e6 / per_s),
+                views,
+                most_of_one,
+                calls_per_s = format_args!("{:.0}", calls as f64 / per_s),
+                ms_per_s = format_args!("{:.0}", remaps(1) as f64 / 1e6 / per_s),
+                kernel_ms_per_s = format_args!("{:.0}", remaps(2) as f64 / 1e6 / per_s),
+                notes_ms_per_s = format_args!("{:.0}", remaps(3) as f64 / 1e6 / per_s),
+                split_ms = format_args!("{:.0}", remaps(4) as f64 / 1e6 / per_s),
+                map_ms = format_args!("{:.0}", remaps(5) as f64 / 1e6 / per_s),
+                commit_ms = format_args!("{:.0}", remaps(6) as f64 / 1e6 / per_s),
+                unmap_ms = format_args!("{:.0}", remaps(7) as f64 / 1e6 / per_s),
+                cpu_ms_per_s = format_args!("{:.0}", remaps(8) as f64 / 1e6 / per_s),
+                thread = super::xmem::REMAP_THREAD.load(Ordering::Relaxed),
+                "remapping (the title's and the GPU's page mappings)"
+            );
             summary!(
                 requests = *requests,
                 mb_per_s = format_args!("{:.1}", *bytes as f64 / elapsed.as_secs_f64() / 1e6),

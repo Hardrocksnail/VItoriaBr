@@ -417,6 +417,48 @@ fn physical() -> MutexGuard<'static, Physical> {
     PHYSICAL.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Remapping, for DirectStorage's summary: calls (`XMemMapPhysicalPages`
+/// and the GPU's page mappings), nanoseconds from the call to its end,
+/// in kernel calls, and in the GPU side's notes.
+/// Then the kernel calls one by one: splitting the placeholder, mapping the
+/// view, committing it, unmapping a view.
+/// Last, the processor time of the remapping threads in those calls.
+pub(crate) static REMAPS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+
+/// The last thread that remapped (its id), for the summary.
+pub(crate) static REMAP_THREAD: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Runs a remapping, counting its wall time (step 1) and its thread's
+/// processor time (step 8). In the world the kernel's map and unmap took
+/// 0.5 to 9 ms each with the thread on a push lock 82 % of the time (its
+/// processor time 1 to 3 % of it), while in the loading they took 10 us.
+fn remap_timed<T>(f: impl FnOnce() -> T) -> T {
+    // SAFETY: no preconditions.
+    REMAP_THREAD.store(unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }, Ordering::Relaxed);
+    let cpu = victory_gpu::framelog::thread_times();
+    let result = remap_step(1, f);
+    let now = victory_gpu::framelog::thread_times();
+    REMAPS[8].fetch_add((now.0 + now.1).saturating_sub(cpu.0 + cpu.1) * 1000, Ordering::Relaxed);
+    result
+}
+
+/// Views of physical pages mapped now, and the most any one section has.
+pub(crate) fn view_counts() -> (usize, usize) {
+    let physical = physical();
+    let mut per: HashMap<usize, usize> = HashMap::new();
+    for (_, slice) in physical.views.values() {
+        *per.entry(Arc::as_ptr(&slice.section) as usize).or_default() += 1;
+    }
+    (physical.views.len(), per.values().copied().max().unwrap_or(0))
+}
+
+fn remap_step<T>(step: usize, f: impl FnOnce() -> T) -> T {
+    let started = std::time::Instant::now();
+    let result = f();
+    REMAPS[step].fetch_add(started.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    result
+}
+
 /// Nanoseconds DirectStorage workers waited for [`PAGES`] and [`SHOWN`],
 /// for its debug summary.
 pub(crate) static PAGE_TABLE_WAIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -705,6 +747,11 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
+    REMAPS[0].fetch_add(1, Ordering::Relaxed);
+    remap_timed(|| map_physical_pages(address, n, pages))
+}
+
+fn map_physical_pages(address: *mut c_void, n: usize, pages: *const usize) -> *mut c_void {
     let base = address as usize;
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
@@ -785,6 +832,11 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
+    REMAPS[0].fetch_add(1, Ordering::Relaxed);
+    remap_timed(|| map_alias_now(to, from, len))
+}
+
+fn map_alias_now(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
     // As in `XMemMapPhysicalPages`: no read in place meets the gap (asked
     // for before the page table, as there).
@@ -821,13 +873,15 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     // SAFETY: splits the placeholder around the range (failing harmlessly
     // when the range is the whole placeholder), then maps the section
     // there; both act only on placeholders.
-    let view = unsafe {
-        VirtualFree(
-            base as *mut c_void,
-            len,
-            MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
-        );
-        MapViewOfFile3(
+    let view = remap_step(2, || unsafe {
+        remap_step(4, || {
+            VirtualFree(
+                base as *mut c_void,
+                len,
+                MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER,
+            )
+        });
+        remap_step(5, || MapViewOfFile3(
             slice.section.0,
             GetCurrentProcess(),
             base as *const c_void,
@@ -837,8 +891,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
             PAGE_READWRITE,
             std::ptr::null_mut(),
             0,
-        )
-    };
+        ))
+    });
     if view.Value as usize != base {
         tracing::warn!(
             address = format_args!("{base:#x}"),
@@ -848,15 +902,17 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
         );
         return false;
     }
-    if !commit(base, len) {
+    if !remap_step(2, || remap_step(6, || commit(base, len))) {
         // SAFETY: the view just mapped, back to a placeholder.
         unsafe { UnmapViewOfFile2(GetCurrentProcess(), view, MEM_PRESERVE_PLACEHOLDER) };
         return false;
     }
-    // New contents, read-write: the GPU side's copies no longer guard it.
-    victory_gpu::title_memory_remapped(base, len);
-    // What the range shows now, for the GPU side's in-place census.
-    victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    remap_step(3, || {
+        // New contents, read-write: the GPU side's copies no longer guard it.
+        victory_gpu::title_memory_remapped(base, len);
+        // What the range shows now, for the GPU side's in-place census.
+        victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    });
     {
         let mut shown = shown();
         for k in 0..len.div_ceil(PAGE) {
@@ -953,9 +1009,9 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 }
             }
         }
-        victory_gpu::title_memory_remapped(at, size);
+        remap_step(3, || victory_gpu::title_memory_remapped(at, size));
         // SAFETY: a view we mapped; it becomes a placeholder again.
-        unsafe {
+        remap_step(2, || remap_step(7, || unsafe {
             UnmapViewOfFile2(
                 GetCurrentProcess(),
                 MEMORY_MAPPED_VIEW_ADDRESS {
@@ -963,7 +1019,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
                 },
                 MEM_PRESERVE_PLACEHOLDER,
             )
-        };
+        }));
         if at < base {
             map(physical, at, base - at, slice.clone());
         }
@@ -1503,5 +1559,46 @@ mod tests {
         assert!(page_window(&[a[0], b[0]], 0, PAGE).is_some());
         assert_eq!(XMemFreePhysicalPages(3, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// How a remap's cost grows with the views a section has: the title
+    /// keeps some 70,000 one-page views of its page pool, and remaps took
+    /// 1-9 ms each in the kernel. `cargo test --release -p victory-hle
+    /// --lib remap_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[allow(non_snake_case)]
+    fn remap_cost_by_views() {
+        let n_views: usize = std::env::var("REMAP_COST_N").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+        let N = n_views;
+        let mut pages = vec![0usize; N + 1];
+        let mut n = N + 1;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let region = XMemVirtualAlloc(std::ptr::null_mut(), (N + 1) * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+        assert!(!region.is_null());
+        let at = |i: usize| region.wrapping_byte_add(i * PAGE);
+        let mut mapped = 0;
+        for target in [100, 1_000, 5_000, 10_000, 20_000].into_iter().filter(|&t| t <= N) {
+            while mapped < target {
+                assert_eq!(XMemMapPhysicalPages(at(mapped), 1, pages[mapped..].as_ptr()), at(mapped));
+                mapped += 1;
+            }
+            // A remap of the spare address, back and forth, with `mapped`
+            // other views of the section standing.
+            let started = std::time::Instant::now();
+            for _ in 0..200 {
+                assert_eq!(XMemMapPhysicalPages(at(N), 1, pages[N..].as_ptr()), at(N));
+                // Touched, as the title and the GPU side touch what they map:
+                // the unmap then has page-table entries to take back.
+                for k in (0..PAGE).step_by(4096) {
+                    // SAFETY: mapped read-write just now.
+                    unsafe { at(N).cast::<u8>().add(k).write_volatile(1) };
+                }
+                assert_eq!(XMemMapPhysicalPages(at(N), 1, std::ptr::null()), at(N));
+            }
+            let us = started.elapsed().as_secs_f64() * 1e6 / 400.0;
+            eprintln!("views {mapped:>6}: {us:8.1} us per map or unmap");
+        }
+        assert_eq!(XMemMapPhysicalPages(region, N, std::ptr::null()), region);
     }
 }
