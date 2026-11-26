@@ -338,6 +338,29 @@ pub(crate) fn program_hash_starts_with(prefixes: &[String]) -> bool {
     })
 }
 
+/// Whether a switch that names programs holds for the program being
+/// translated: unset, empty or `0`: no; `1`: yes; a list of program hash
+/// prefixes (`<hash>,...`): for those; `!<hash>,...`: for all but those.
+pub(crate) fn program_switch(set: &str) -> bool {
+    let set = set.trim();
+    match set {
+        "" | "0" => false,
+        "1" => true,
+        _ => {
+            let (except, list) = match set.strip_prefix('!') {
+                Some(rest) => (true, rest),
+                None => (false, set),
+            };
+            let hashes: Vec<String> = list
+                .split(',')
+                .map(|h| h.trim().to_ascii_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect();
+            program_hash_starts_with(&hashes) != except
+        }
+    }
+}
+
 /// Translates the vertex, pixel, compute or mesh program of a console
 /// shader container.
 ///
@@ -464,8 +487,11 @@ pub fn emit(
         // waves: this form puts group barriers inside branches and loops, and runs 121-124
         // lost the card in a submission of two programs that had just moved to it
         // (`ptfx_CS_lightAtlas_Sprite` and `_Trail`). The 32-lane programs' form below, which
-        // has no barrier, stays on.
-        let wide_on = std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1");
+        // has no barrier, stays on. A list of program hashes turns it on for
+        // those alone ([`program_switch`]): on an RTX 4060 the particle
+        // visibility, ray-tracing tiling and the two water transmission
+        // programs translate in 32-lane waves only this way.
+        let wide_on = program_switch(&std::env::var("VICTORY_WAVE_WIDE").unwrap_or_default());
         // exact first: each host wave on its own where that is exact (the idiom, every
         // form; no barriers), then the other exact forms; then approximate
         for exact in [true, false] {
