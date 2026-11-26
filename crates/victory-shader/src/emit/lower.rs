@@ -10138,20 +10138,24 @@ impl<'a> Lower<'a> {
             let mut vals =
                 self.vgprs(inst, data.as_ref().ok_or("buffer store data")?, regs as u8)?;
             if d16 {
-                // shortcut: d16 data is taken as f16 (integer formats would
-                // keep 16 bits), widened for the 32-bit float store.
+                // d16 data is the 16-bit integer, zero-extended, stored
+                // through a uint-typed handle (below). The title's only d16
+                // typed accesses, its face network (`compute_graph_ops`), go
+                // through R16_UINT and R16G16B16A16_UINT views, where the
+                // console moves the bits as they are (upstream 4243a96a). As
+                // halves through a float handle a store wrote a float's bits
+                // and a load read zeros: the faces did not move.
+                // shortcut: a d16 view of a float format would want the f16
+                // conversion back; none is in the title's world set.
                 let mut wide = Vec::new();
+                let lo = self.s.m.i32(0xFFFF);
                 for k in 0..count {
                     let mut x = vals[(k / 2) as usize];
                     if k % 2 == 1 {
                         let k16 = self.s.m.i32(16);
                         x = self.s.m.bin(c, Bin::LShr, x, k16);
                     }
-                    let f32t = self.s.t.f32;
-                    let f = self
-                        .s
-                        .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
-                    wide.push(self.as_int(f));
+                    wide.push(self.s.m.bin(c, Bin::And, x, lo));
                 }
                 vals = wide;
             }
@@ -10162,12 +10166,13 @@ impl<'a> Lower<'a> {
                 if count != 4 || *offen || *offset != 0 {
                     return Err("a typed buffer store of some channels or at an offset");
                 }
-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
+                // (d16: four U32 channels, `0x405`; else four F32, `0x409`.)
+                args.push(self.handle(site, src, false, (10 | u, if d16 { 0x405 } else { 0x409 }))?);
                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
                 for x in vals {
-                    args.push(self.as_float(x));
+                    args.push(if d16 { x } else { self.as_float(x) });
                 }
-                (69, "bufferStore.f32")
+                (69, if d16 { "bufferStore.i32" } else { "bufferStore.f32" })
             } else {
                 match index {
                     // A raw buffer (stride 1) written by index: the index is the byte.
@@ -10227,16 +10232,24 @@ impl<'a> Lower<'a> {
             if uav {
                 self.s.flags |= flags::TYPED_UAV_LOADS;
             }
-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+            // d16: the 16-bit integers through a uint-typed handle (see the
+            // store above); the result type is made only where it is used.
+            let h = self.handle(site, src, false, (10 | u, if d16 { 0x405 } else { 0x409 }))?;
             let index = index.unwrap_or(self.s.m.i32(0));
-            self.s.op(
-                c,
-                "bufferLoad.f32",
-                Attr::ReadOnly,
-                self.s.t.res_ret,
-                68,
-                &[h, index, iu],
-            )
+            if d16 {
+                let i32t = self.s.t.i32;
+                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
+                self.s.op(c, "bufferLoad.i32", Attr::ReadOnly, ret, 68, &[h, index, iu])
+            } else {
+                self.s.op(
+                    c,
+                    "bufferLoad.f32",
+                    Attr::ReadOnly,
+                    self.s.t.res_ret,
+                    68,
+                    &[h, index, iu],
+                )
+            }
         } else {
             let mask = self.s.m.i8((1u8 << count) - 1);
             let align = self.s.m.i32(4);
@@ -10286,16 +10299,16 @@ impl<'a> Lower<'a> {
             return Err("a buffer result");
         };
         if d16 {
-            // Two f16 channels per VGPR (an odd last high half 0).
+            // Two 16-bit channels per VGPR (an odd last high half 0): each
+            // channel's low 16 bits, as the integer view holds them (the
+            // typed load above is a uint one).
             let k16 = self.s.m.i32(16);
-            let i32t = self.s.t.i32;
+            let lo = self.s.m.i32(0xFFFF);
             for k in 0..count.div_ceil(2) {
                 let mut x = None;
                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
                     let f = self.s.m.extract(c, r, ch);
-                    let h = self
-                        .s
-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
+                    let h = self.s.m.bin(c, Bin::And, f, lo);
                     x = Some(match x {
                         Some(hi) => {
                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
