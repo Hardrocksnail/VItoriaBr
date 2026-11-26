@@ -562,6 +562,10 @@ impl Lanes {
                 };
             }
             let waiting: usize = self.lanes.values().map(|l| l.reads.len()).sum();
+            // Reads into physical pages held for the title's Submit, and
+            // commands enqueued but not submitted.
+            let held: usize = self.lanes.values().map(|l| l.held.len()).sum();
+            let unsubmitted: usize = self.lanes.values().map(|l| l.unsubmitted.len()).sum();
             let reading = READING.swap(0, Ordering::Relaxed) as f64 / 1e9;
             let step = |s: Step| STEPS[s as usize].swap(0, Ordering::Relaxed) as f64 / 1e9 / elapsed.as_secs_f64();
             #[cfg(windows)]
@@ -597,6 +601,8 @@ impl Lanes {
                 bcpack_mb = self.bcpack.0 / 1_000_000,
                 bcpack_workers = format_args!("{:.2}", self.bcpack.1.as_secs_f64() / elapsed.as_secs_f64()),
                 waiting,
+                held,
+                unsubmitted,
                 "dstorage: last {:.1} s",
                 elapsed.as_secs_f64()
             );
