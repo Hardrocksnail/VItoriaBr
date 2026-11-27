@@ -350,15 +350,47 @@ pub(crate) static WALKS_HELD: std::sync::atomic::AtomicU64 = std::sync::atomic::
 /// With the switch such a dispatch is dropped until the builder has run
 /// whole. What the passes would have written stays as the title left it
 /// (their targets are not cleared by us): the picture has to be looked at.
+///
+/// `1` holds every such program; `<hash>,...` those alone; `!<hash>,...`
+/// all but those (the irradiance cache's four: held, faces went black in
+/// the police scene, as with ray misses there).
 #[cfg(windows)]
 pub(crate) fn walk_held(this: This) -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    if this.is_null() || !*ON.get_or_init(|| std::env::var_os("VICTORY_BVH_HOLD").is_some_and(|v| v == "1")) {
+    enum Hold {
+        Off,
+        All,
+        Only(Vec<String>),
+        Except(Vec<String>),
+    }
+    static HOLD: OnceLock<Hold> = OnceLock::new();
+    let hold = HOLD.get_or_init(|| {
+        let set = std::env::var("VICTORY_BVH_HOLD").unwrap_or_default();
+        let set = set.trim();
+        match set {
+            "" | "0" => Hold::Off,
+            "1" => Hold::All,
+            _ => {
+                let (except, list) = match set.strip_prefix('!') {
+                    Some(rest) => (true, rest),
+                    None => (false, set),
+                };
+                let hashes = list.split(',').map(|h| h.trim().to_ascii_lowercase()).filter(|h| !h.is_empty()).collect();
+                if except { Hold::Except(hashes) } else { Hold::Only(hashes) }
+            }
+        }
+    });
+    if this.is_null() || matches!(hold, Hold::Off) {
         return false;
     }
     let p = pipeline(this);
     if !p.shaders.iter().any(|s| s.stage == "compute" && s.walks()) {
         return false;
+    }
+    let listed = |hashes: &[String]| p.shaders.iter().any(|s| hashes.iter().any(|h| s.hash.starts_with(h.as_str())));
+    match hold {
+        Hold::Only(hashes) if !listed(hashes) => return false,
+        Hold::Except(hashes) if listed(hashes) => return false,
+        _ => {}
     }
     // (Asked only for the few programs that walk: the lock is the builder's.)
     if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
@@ -534,7 +566,7 @@ pub(crate) fn making() -> u64 {
 static DROPS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
 
 /// Shader hashes as printed in the pipeline diagnostics.
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn parse_skip_hashes(value: &str) -> Vec<String> {
     value
         .split(',')
@@ -554,7 +586,7 @@ fn parse_skip_hashes(value: &str) -> Vec<String> {
         .collect()
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+#[cfg(windows)]
 fn skipped_shader(p: &Pipeline) -> Option<&str> {
     static HASHES: OnceLock<Vec<String>> = OnceLock::new();
     let hashes = HASHES.get_or_init(|| {
@@ -570,7 +602,10 @@ fn skipped_shader(p: &Pipeline) -> Option<&str> {
         .map(|shader| shader.hash.as_str())
 }
 
-#[cfg(all(windows, feature = "diagnostics"))]
+/// Whether draws and dispatches of `this` are left out
+/// (`VICTORY_SKIP_PIPELINES=<hash>,...`: a pipeline with any of those
+/// shaders; release builds too).
+#[cfg(windows)]
 pub(crate) fn is_skipped(this: This) -> bool {
     !this.is_null() && skipped_shader(pipeline(this)).is_some()
 }
